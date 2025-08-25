@@ -14,7 +14,7 @@ import { NCard, NButton } from 'naive-ui'
 
 const pikpak = ref(null)
 const domain = ref('')
-const iframeSrc = ref("http://localhost:3006/api/proxy?url=https://mypikpak.com/zh-CN")
+const iframeSrc = ref(domain.value + "/api/proxy?url=https://mypikpak.com/zh-CN")
 
 const handleClick = () => {
   console.log(window.location.origin)

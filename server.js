@@ -5,7 +5,10 @@ const url = require('url');
 const querystring = require('querystring');
 
 const app = express();
-const PORT = 3006; // 代理服务器端口
+
+// 从环境变量获取配置，适配Render部署
+const PORT = process.env.PORT || 3006; // Render会自动分配端口
+const PROXY_DOMAIN = process.env.PROXY_DOMAIN || `localhost:${PORT}`; // 可在Render设置中配置域名
 app.use(express.static('assets/dist')); // 假设你的静态文件在dist目录下
 // 解析请求体，用于转发POST等带数据的请求
 app.use(express.raw({ type: '*/*', limit: '10mb' }));
@@ -72,7 +75,7 @@ app.all('/api/proxy', (req, res) => {
     let modifiedHeaders = { ...proxyRes.headers };
     
     // 添加自定义代理头
-    modifiedHeaders['x-proxy-server'] = 'ExpressFixedProxy';
+    modifiedHeaders['x-proxy-server'] = 'ExpressRenderProxy';
     
     // 处理重定向，确保重定向后仍通过代理访问
     if ([301, 302, 307, 308].includes(proxyRes.statusCode) && modifiedHeaders.location) {
@@ -80,7 +83,9 @@ app.all('/api/proxy', (req, res) => {
         // 解析重定向URL（处理相对路径重定向）
         const redirectUrl = new URL(modifiedHeaders.location, targetUrl.href);
         // 构建通过代理访问的重定向URL
-        const proxyRedirectUrl = new URL(`http://localhost:${PORT}/api/proxy`);
+        // 自动判断协议（Render部署通常使用https）
+        const protocol = req.protocol || (req.headers['x-forwarded-proto'] || 'http');
+        const proxyRedirectUrl = new URL(`${protocol}://${PROXY_DOMAIN}/api/proxy`);
         proxyRedirectUrl.searchParams.set('url', redirectUrl.href);
         modifiedHeaders.location = proxyRedirectUrl.href;
       } catch (e) {
@@ -103,8 +108,10 @@ app.all('/api/proxy', (req, res) => {
       try {
         let bodyStr = body.toString('utf8');
         
+        // 自动判断协议（Render部署通常使用https）
+        const protocol = req.protocol || (req.headers['x-forwarded-proto'] || 'http');
         // 构建代理服务器基础URL
-        const proxyBaseUrl = `http://localhost:${PORT}/api/proxy?url=`;
+        const proxyBaseUrl = `${protocol}://${PROXY_DOMAIN}/api/proxy?url=`;
         // 目标网站的根地址
         const targetOrigin = targetUrl.origin;
         // 当前页面的完整URL
@@ -112,7 +119,7 @@ app.all('/api/proxy', (req, res) => {
 
         // 针对不同内容类型进行URL替换
         if (modifiedHeaders['content-type']) {
-          // 处理HTML内容 - 重点处理相对路径
+          // 处理HTML内容
           if (modifiedHeaders['content-type'].includes('text/html')) {
             // 1. 处理绝对路径（带域名的URL）
             bodyStr = bodyStr.replace(
@@ -230,10 +237,21 @@ app.all('/api/proxy', (req, res) => {
   proxyReq.end();
 });
 
+// 根路由，提供使用说明
+app.get('/', (req, res) => {
+  const protocol = req.protocol || (req.headers['x-forwarded-proto'] || 'http');
+  const baseUrl = `${protocol}://${PROXY_DOMAIN}`;
+  res.send(`
+    <h1>代理服务器已启动</h1>
+    <p>使用方法: ${baseUrl}/api/proxy?url=目标URL</p>
+    <p>示例: <a href="${baseUrl}/api/proxy?url=https://example.com">${baseUrl}/api/proxy?url=https://example.com</a></p>
+  `);
+});
+
 // 启动服务器
 app.listen(PORT, () => {
-  console.log(`修正正则表达式错误的代理服务器已启动，监听端口 ${PORT}`);
-  console.log(`使用方法: http://localhost:${PORT}/api/proxy?url=目标URL`);
-  console.log(`示例: http://localhost:${PORT}/api/proxy?url=https://example.com/zh-CN`);
+  console.log(`代理服务器已启动，监听端口 ${PORT}`);
+  console.log(`访问地址: http://localhost:${PORT}`);
+  console.log(`Render部署后地址将自动配置为环境变量中的域名`);
 });
     
