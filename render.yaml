@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: proxy-with-static
+    env: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: PROXY_DOMAIN
+        value: proxy-test-5ajb.onrender.com  # 替换为你的Render应用域名
+    staticPublishPath: ./assets/dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /
