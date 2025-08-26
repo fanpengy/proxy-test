@@ -11,7 +11,9 @@ const app = express();
 const PORT = process.env.PORT || 3006;
 const PROXY_DOMAIN = process.env.PROXY_DOMAIN || `localhost:${PORT}`;
 
-// 解析请求体
+// 解析请求体 - 使用更灵活的解析方式
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.raw({ type: '*/*', limit: '10mb' }));
 
 // 提供静态文件
@@ -36,6 +38,28 @@ const getTargetUrl = (req) => {
     console.error('无效的目标URL:', e.message);
     return null;
   }
+};
+
+// 安全转换请求体为Buffer
+const convertToBuffer = (body) => {
+  if (!body) return null;
+  
+  // 已经是Buffer或string，直接处理
+  if (body instanceof Buffer) return body;
+  if (typeof body === 'string') return Buffer.from(body);
+  
+  // 对象类型转换为JSON字符串
+  if (typeof body === 'object') {
+    try {
+      return Buffer.from(JSON.stringify(body));
+    } catch (e) {
+      console.error('转换对象为JSON失败:', e.message);
+      return null;
+    }
+  }
+  
+  // 其他类型尝试转换为字符串
+  return Buffer.from(String(body));
 };
 
 // 代理路由
@@ -104,22 +128,15 @@ app.all('/api/proxy', (req, res) => {
     const responseBody = [];
     
     proxyRes.on('data', (chunk) => {
-      // 确保只收集Buffer类型的数据
-      if (chunk instanceof Buffer || typeof chunk === 'string') {
-        responseBody.push(chunk);
-      } else {
-        console.warn('收到非Buffer/string类型的响应数据，已忽略');
-      }
+      responseBody.push(chunk);
     });
     
     proxyRes.on('end', () => {
       if (responseSent) return; // 已发送响应则退出
       
       try {
-        // 合并响应体（确保是Buffer类型）
-        let body = Buffer.concat(responseBody.map(chunk => 
-          typeof chunk === 'string' ? Buffer.from(chunk) : chunk
-        ));
+        // 合并响应体
+        let body = Buffer.concat(responseBody);
         
         // 处理文本内容
         let bodyStr;
@@ -231,19 +248,19 @@ app.all('/api/proxy', (req, res) => {
     safeSend(500, `代理错误: ${err.message}`);
   });
 
-  // 转发请求体
-  if (req.body && !responseSent) {
-    // 确保请求体是正确的类型
-    if (req.body instanceof Buffer || typeof req.body === 'string') {
-      proxyReq.write(req.body);
-    } else {
-      console.error('请求体类型不正确，无法转发');
-      safeSend(400, '请求体格式错误');
-      return;
+  // 转发请求体 - 增加更灵活的处理
+  if (!responseSent) {
+    try {
+      const requestBody = convertToBuffer(req.body);
+      if (requestBody) {
+        proxyReq.write(requestBody);
+      }
+      proxyReq.end();
+    } catch (e) {
+      console.error('转发请求体错误:', e.message);
+      safeSend(400, `请求体处理错误: ${e.message}`);
     }
   }
-  
-  proxyReq.end();
 });
 
 // 根路由说明
@@ -259,6 +276,6 @@ app.get('/', (req, res) => {
 
 // 启动服务器
 app.listen(PORT, () => {
-  console.log(`代理服务器已启动，监听端口 ${PORT}`);
+  console.log(`代理服务器已启动，监听端口: ${PORT}`);
 });
     
