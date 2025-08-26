@@ -3,30 +3,31 @@ const http = require('http');
 const https = require('https');
 const url = require('url');
 const querystring = require('querystring');
+const path = require('path');
 
 const app = express();
 
-// 从环境变量获取配置，适配Render部署
-const PORT = process.env.PORT || 3006; // Render会自动分配端口
-const PROXY_DOMAIN = process.env.PROXY_DOMAIN || `localhost:${PORT}`; // 可在Render设置中配置域名
-app.use(express.static('assets/dist')); // 假设你的静态文件在dist目录下
-// 解析请求体，用于转发POST等带数据的请求
+// 从环境变量获取配置
+const PORT = process.env.PORT || 3006;
+const PROXY_DOMAIN = process.env.PROXY_DOMAIN || `localhost:${PORT}`;
+
+// 解析请求体
 app.use(express.raw({ type: '*/*', limit: '10mb' }));
 
-// 提取URL参数中的目标URL并验证
+// 提供静态文件
+app.use(express.static(path.join(__dirname, 'assets/dist')));
+
+// 提取并验证目标URL
 const getTargetUrl = (req) => {
   const parsedUrl = url.parse(req.url);
   const queryParams = querystring.parse(parsedUrl.query);
   
-  // 检查是否提供了url参数
   if (!queryParams.url) {
     return null;
   }
   
-  // 验证URL格式
   try {
     const targetUrl = new URL(queryParams.url);
-    // 只允许http和https协议
     if (!['http:', 'https:'].includes(targetUrl.protocol)) {
       return null;
     }
@@ -39,15 +40,26 @@ const getTargetUrl = (req) => {
 
 // 代理路由
 app.all('/api/proxy', (req, res) => {
-  // 获取并验证目标URL
+  // 防止重复发送响应的标志
+  let responseSent = false;
+  
+  // 检查响应是否已发送
+  const safeSend = (status, data) => {
+    if (!responseSent && !res.headersSent) {
+      responseSent = true;
+      res.status(status).send(data);
+    }
+  };
+
+  // 获取目标URL
   const targetUrl = getTargetUrl(req);
   if (!targetUrl) {
-    return res.status(400).send('请提供有效的URL参数，格式: /api/proxy?url=https://example.com');
+    return safeSend(400, '请提供有效的URL参数，格式: /api/proxy?url=https://example.com');
   }
 
   console.log(`代理请求: ${req.method} ${targetUrl.href}`);
 
-  // 构造目标服务器的请求选项
+  // 构造请求选项
   const path = targetUrl.pathname + targetUrl.search;
   const options = {
     hostname: targetUrl.hostname,
@@ -57,117 +69,107 @@ app.all('/api/proxy', (req, res) => {
     headers: { ...req.headers }
   };
 
-  // 修正Host头，指向目标服务器
+  // 修正Host头
   options.headers.host = targetUrl.host;
   
   // 移除可能导致问题的头信息
-  delete options.headers['accept-encoding']; // 禁用压缩，便于修改内容
+  delete options.headers['accept-encoding'];
   delete options.headers['origin'];
 
-  // 根据目标协议选择http或https模块
+  // 选择协议模块
   const proxyModule = targetUrl.protocol === 'https:' ? https : http;
 
-  // 向目标服务器发送请求
+  // 发送代理请求
   const proxyReq = proxyModule.request(options, (proxyRes) => {
     console.log(`目标服务器响应: ${proxyRes.statusCode}`);
 
     // 准备修改响应头
     let modifiedHeaders = { ...proxyRes.headers };
+    modifiedHeaders['x-proxy-server'] = 'ExpressFixedProxy';
     
-    // 添加自定义代理头
-    modifiedHeaders['x-proxy-server'] = 'ExpressRenderProxy';
-    
-    // 处理重定向，确保重定向后仍通过代理访问
+    // 处理重定向
     if ([301, 302, 307, 308].includes(proxyRes.statusCode) && modifiedHeaders.location) {
       try {
-        // 解析重定向URL（处理相对路径重定向）
         const redirectUrl = new URL(modifiedHeaders.location, targetUrl.href);
-        // 构建通过代理访问的重定向URL
-        // 自动判断协议（Render部署通常使用https）
         const protocol = req.protocol || (req.headers['x-forwarded-proto'] || 'http');
         const proxyRedirectUrl = new URL(`${protocol}://${PROXY_DOMAIN}/api/proxy`);
         proxyRedirectUrl.searchParams.set('url', redirectUrl.href);
         modifiedHeaders.location = proxyRedirectUrl.href;
       } catch (e) {
-        console.error('处理重定向URL错误:', e.message);
+        console.error('处理重定向错误:', e.message);
       }
     }
 
-    // 收集并修改响应体
-    let responseBody = [];
+    // 收集响应体
+    const responseBody = [];
     
     proxyRes.on('data', (chunk) => {
-      responseBody.push(chunk);
+      // 确保只收集Buffer类型的数据
+      if (chunk instanceof Buffer || typeof chunk === 'string') {
+        responseBody.push(chunk);
+      } else {
+        console.warn('收到非Buffer/string类型的响应数据，已忽略');
+      }
     });
     
     proxyRes.on('end', () => {
-      // 合并响应体
-      let body = Buffer.concat(responseBody);
+      if (responseSent) return; // 已发送响应则退出
       
-      // 尝试处理文本内容
       try {
-        let bodyStr = body.toString('utf8');
+        // 合并响应体（确保是Buffer类型）
+        let body = Buffer.concat(responseBody.map(chunk => 
+          typeof chunk === 'string' ? Buffer.from(chunk) : chunk
+        ));
         
-        // 自动判断协议（Render部署通常使用https）
+        // 处理文本内容
+        let bodyStr;
+        try {
+          bodyStr = body.toString('utf8');
+        } catch (e) {
+          // 非文本内容直接转发
+          res.writeHead(proxyRes.statusCode, modifiedHeaders);
+          res.end(body);
+          responseSent = true;
+          return;
+        }
+        
+        // 构建代理基础URL
         const protocol = req.protocol || (req.headers['x-forwarded-proto'] || 'http');
-        // 构建代理服务器基础URL
         const proxyBaseUrl = `${protocol}://${PROXY_DOMAIN}/api/proxy?url=`;
-        // 目标网站的根地址
         const targetOrigin = targetUrl.origin;
-        // 当前页面的完整URL
         const currentPageUrl = targetUrl.href;
 
-        // 针对不同内容类型进行URL替换
+        // 根据内容类型处理
         if (modifiedHeaders['content-type']) {
-          // 处理HTML内容
+          // 处理HTML
           if (modifiedHeaders['content-type'].includes('text/html')) {
-            // 1. 处理绝对路径（带域名的URL）
             bodyStr = bodyStr.replace(
               new RegExp(`(src|href|action)=["'](${targetOrigin})([^"']*)["']`, 'gi'),
-              (match, attr, origin, path) => {
-                const fullUrl = `${origin}${path}`;
-                return `${attr}="${proxyBaseUrl}${encodeURIComponent(fullUrl)}"`;
-              }
+              (match, attr, origin, path) => `${attr}="${proxyBaseUrl}${encodeURIComponent(origin + path)}"`
             );
             
-            // 2. 处理根相对路径（以/开头的路径）
             bodyStr = bodyStr.replace(
               new RegExp(`(src|href|action)=["']/([^"']*)["']`, 'gi'),
-              (match, attr, path) => {
-                const fullUrl = `${targetOrigin}/${path}`;
-                return `${attr}="${proxyBaseUrl}${encodeURIComponent(fullUrl)}"`;
-              }
+              (match, attr, path) => `${attr}="${proxyBaseUrl}${encodeURIComponent(targetOrigin + '/' + path)}"`
             );
             
-            // 3. 处理相对路径（不以/开头的路径）
             bodyStr = bodyStr.replace(
               new RegExp(`(src|href|action)=["']([^"']*[^/])["']`, 'gi'),
               (match, attr, path) => {
-                // 排除已经是代理链接的情况或绝对URL
-                if (path.startsWith(proxyBaseUrl) || path.includes('://')) {
-                  return match;
-                }
-                
-                // 构建完整URL
+                if (path.startsWith(proxyBaseUrl) || path.includes('://')) return match;
                 const fullUrl = new URL(path, currentPageUrl).href;
                 return `${attr}="${proxyBaseUrl}${encodeURIComponent(fullUrl)}"`;
               }
             );
           }
           
-          // 处理JavaScript内容
+          // 处理JavaScript
           else if (modifiedHeaders['content-type'].includes('javascript')) {
-            // 处理各种URL引用模式
             bodyStr = bodyStr.replace(
               new RegExp(`(["'])([^"']+)\\1`, 'gi'),
               (match, quote, path) => {
-                // 排除已经是代理链接的情况
-                if (path.startsWith(proxyBaseUrl)) {
-                  return match;
-                }
-                
+                if (path.startsWith(proxyBaseUrl)) return match;
                 try {
-                  // 尝试解析URL
                   const fullUrl = new URL(path, currentPageUrl).href;
                   return `${quote}${proxyBaseUrl}${encodeURIComponent(fullUrl)}${quote}`;
                 } catch (e) {
@@ -176,7 +178,6 @@ app.all('/api/proxy', (req, res) => {
               }
             );
             
-            // 处理fetch和XMLHttpRequest
             bodyStr = bodyStr.replace(
               new RegExp(`(fetch|open)\\(\\s*["']([^"']*)["']`, 'gi'),
               (match, method, path) => {
@@ -190,10 +191,9 @@ app.all('/api/proxy', (req, res) => {
             );
           }
           
-          // 处理CSS内容
+          // 处理CSS
           else if (modifiedHeaders['content-type'].includes('text/css') ||
                    modifiedHeaders['content-type'].includes('stylesheet')) {
-            // 处理CSS中的url()引用
             bodyStr = bodyStr.replace(
               new RegExp(`url\\(\\s*["']?([^"')]+)["']?\\s*\\)`, 'gi'),
               (match, path) => {
@@ -208,36 +208,45 @@ app.all('/api/proxy', (req, res) => {
           }
         }
         
-        // 转换回Buffer
+        // 转换回Buffer并更新长度
         body = Buffer.from(bodyStr, 'utf8');
-        
-        // 更新内容长度
         modifiedHeaders['content-length'] = body.length;
+        
+        // 发送响应
+        if (!responseSent) {
+          res.writeHead(proxyRes.statusCode, modifiedHeaders);
+          res.end(body);
+          responseSent = true;
+        }
       } catch (e) {
-        console.log('非文本内容，直接转发');
+        console.error('处理响应体错误:', e.message);
+        safeSend(500, `处理响应时出错: ${e.message}`);
       }
-      
-      // 发送修改后的响应给客户端
-      res.writeHead(proxyRes.statusCode, modifiedHeaders);
-      res.end(body);
     });
   });
 
   // 处理代理请求错误
   proxyReq.on('error', (err) => {
     console.error('代理请求错误:', err);
-    res.status(500).send(`代理错误: ${err.message}`);
+    safeSend(500, `代理错误: ${err.message}`);
   });
 
-  // 转发请求体（如POST数据）
-  if (req.body) {
-    proxyReq.write(req.body);
+  // 转发请求体
+  if (req.body && !responseSent) {
+    // 确保请求体是正确的类型
+    if (req.body instanceof Buffer || typeof req.body === 'string') {
+      proxyReq.write(req.body);
+    } else {
+      console.error('请求体类型不正确，无法转发');
+      safeSend(400, '请求体格式错误');
+      return;
+    }
   }
   
   proxyReq.end();
 });
 
-// 根路由，提供使用说明
+// 根路由说明
 app.get('/', (req, res) => {
   const protocol = req.protocol || (req.headers['x-forwarded-proto'] || 'http');
   const baseUrl = `${protocol}://${PROXY_DOMAIN}`;
@@ -251,7 +260,5 @@ app.get('/', (req, res) => {
 // 启动服务器
 app.listen(PORT, () => {
   console.log(`代理服务器已启动，监听端口 ${PORT}`);
-  console.log(`访问地址: http://localhost:${PORT}`);
-  console.log(`Render部署后地址将自动配置为环境变量中的域名`);
 });
     
